@@ -1,0 +1,228 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>NetworkPolicy 清理演练（单命名空间）</title>
+  <style>
+    :root { --line: #d0d7de; --bg: #f6f8fa; --ok: #1a7f37; --bad: #cf222e; --muted: #656d76; }
+    * { box-sizing: border-box; }
+    body { font-family: -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif; margin: 0; padding: 24px; color: #1f2328; }
+    h1 { font-size: 20px; margin: 0 0 4px; }
+    h2 { font-size: 16px; margin: 24px 0 8px; }
+    .muted { color: var(--muted); font-size: 13px; }
+    .panel { border: 1px solid var(--line); border-radius: 8px; padding: 16px; margin-bottom: 16px; background: #fff; }
+    .row { display: grid; gap: 8px; align-items: start; padding: 10px; border: 1px solid var(--line); border-radius: 6px; margin-bottom: 8px; background: var(--bg); position: relative; }
+    .pod-row { grid-template-columns: 160px 1fr 90px; }
+    .policy-row { grid-template-columns: 150px 150px 130px 1fr 1fr 110px 90px; }
+    label.field { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+    input[type=text], textarea { width: 100%; padding: 6px 8px; border: 1px solid var(--line); border-radius: 6px; font: inherit; font-size: 13px; }
+    textarea { min-height: 64px; resize: vertical; font-family: ui-monospace, Menlo, Consolas, monospace; }
+    .checks { display: flex; flex-direction: column; gap: 6px; font-size: 13px; }
+    button { padding: 7px 14px; border-radius: 6px; border: 1px solid var(--line); background: #f6f8fa; cursor: pointer; font: inherit; }
+    button.primary { background: #0969da; color: #fff; border-color: #0969da; font-weight: 600; }
+    button:disabled { opacity: .5; cursor: not-allowed; }
+    .btn-remove { background: #fff; color: var(--bad); }
+    .toolbar { display: flex; gap: 10px; align-items: center; margin-top: 8px; }
+    .banner { padding: 12px 14px; border-radius: 8px; margin-bottom: 16px; font-size: 14px; }
+    .banner.ok { background: #dafbe1; border: 1px solid #4ac26b; }
+    .banner.err { background: #ffebe9; border: 1px solid #ff8182; }
+    table.matrix { border-collapse: collapse; font-size: 12px; }
+    table.matrix th, table.matrix td { border: 1px solid var(--line); padding: 5px 8px; text-align: center; }
+    table.matrix th { background: var(--bg); }
+    td.yes { color: var(--ok); font-weight: 600; }
+    td.no { color: var(--bad); }
+    td.diff { background: #fff8c5; outline: 2px solid #d4a72c; }
+    .matrices { display: flex; gap: 32px; flex-wrap: wrap; }
+    .removed-badge { position: absolute; top: -9px; right: 10px; background: var(--bad); color: #fff; font-size: 11px; padding: 1px 8px; border-radius: 10px; }
+    code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+    ul.help { font-size: 13px; color: var(--muted); margin: 6px 0; padding-left: 20px; }
+  </style>
+</head>
+<body>
+  <h1>NetworkPolicy 清理演练（单命名空间）</h1>
+  <p class="muted">录入 Pod 标签与最多 {{ max_policies }} 条策略，勾选可删项后点击清理：求解器按当前标签找数量最大的等价删除组。规则：未被策略选中的方向默认放行；被选中时取各策略对端的并集；连通须同时满足发端出站与收端入站；忽略端口。</p>
+
+  {% if error %}
+  <div class="banner err">输入有误：{{ error }}</div>
+  {% endif %}
+
+  {% if result %}
+  <div class="banner ok">
+    {% if result.removed_names %}
+      实际删除 {{ result.removed_names|length }} 条策略：<strong>{{ result.removed_names|join('、') }}</strong>。
+    {% else %}
+      没有找到可安全删除的策略组，保留全部策略。
+    {% endif %}
+    {% if result.equivalent %}删除前后每对 Pod 各方向的连通结果完全相同。{% else %}
+      <span style="color:var(--bad)">警告：删除前后连通矩阵不一致！</span>
+    {% endif %}
+  </div>
+  {% endif %}
+
+  <form method="post" action="/clean" id="main-form">
+    <div class="panel">
+      <h2 style="margin-top:0">Pod 与标签</h2>
+      <div class="muted" style="margin-bottom:8px">标签写法 <code>key=value</code>，多个标签用逗号分隔。</div>
+      <div id="pod-container">
+        {% for pod in view.pods %}
+        <div class="row pod-row">
+          <label class="field">名称
+            <input type="text" data-field="pod_name_{i}" value="{{ pod.name }}">
+          </label>
+          <label class="field">标签
+            <input type="text" data-field="pod_labels_{i}" value="{{ pod.labels_text }}">
+          </label>
+          <button type="button" class="btn-remove" onclick="removeRow(this)">删除 Pod</button>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="toolbar">
+        <button type="button" onclick="addPod()">添加 Pod</button>
+      </div>
+    </div>
+
+    <div class="panel">
+      <h2 style="margin-top:0">NetworkPolicy（最多 {{ max_policies }} 条，当前 <span id="policy-count">{{ view.policies|length }}</span> 条）</h2>
+      <ul class="help">
+        <li>Pod 选择器：留空表示选中本命名空间全部 Pod；否则填 <code>key=value,key=value</code>。</li>
+        <li>入站/出站对端：每行一个对端选择器（行内逗号分隔多个标签）；<code>*</code> 单独一行表示全选；留空表示该方向没有允许对端（选中即拒绝）。</li>
+        <li>每条策略至少启用入站或出站一个方向。勾选“可删”后该策略才会进入求解候选。</li>
+      </ul>
+      <div id="policy-container">
+        {% for policy in view.policies %}
+        <div class="row policy-row">
+          {% if result and policy.name in result.removed_names %}<span class="removed-badge">本次已删除</span>{% endif %}
+          <label class="field">策略名
+            <input type="text" data-field="policy_name_{i}" value="{{ policy.name }}">
+          </label>
+          <label class="field">Pod 选择器
+            <input type="text" data-field="policy_selector_{i}" value="{{ policy.selector_text }}">
+          </label>
+          <div class="checks">
+            <label><input type="checkbox" data-field="policy_ingress_{i}" {% if policy.ingress %}checked{% endif %}> 入站</label>
+            <label><input type="checkbox" data-field="policy_egress_{i}" {% if policy.egress %}checked{% endif %}> 出站</label>
+          </div>
+          <label class="field">入站对端（每行一个）
+            <textarea data-field="policy_ingress_peers_{i}">{{ policy.ingress_peers_text }}</textarea>
+          </label>
+          <label class="field">出站对端（每行一个）
+            <textarea data-field="policy_egress_peers_{i}">{{ policy.egress_peers_text }}</textarea>
+          </label>
+          <div class="checks">
+            <label><input type="checkbox" data-field="policy_deletable_{i}" {% if policy.deletable %}checked{% endif %}> 可删</label>
+          </div>
+          <button type="button" class="btn-remove" onclick="removeRow(this)">删除行</button>
+        </div>
+        {% endfor %}
+      </div>
+      <div class="toolbar">
+        <button type="button" id="add-policy-btn" onclick="addPolicy()">添加策略</button>
+        <button type="submit" class="primary">清理（按当前标签求解）</button>
+        <a href="/"><button type="button">重置为演练数据</button></a>
+      </div>
+    </div>
+  </form>
+
+  {% if result %}
+  <div class="panel">
+    <h2 style="margin-top:0">连通矩阵（行=发端，列=收端）</h2>
+    <div class="matrices">
+      {% for title, matrix in [("删除前", result.before), ("删除后", result.after)] %}
+      <div>
+        <div class="muted" style="margin-bottom:6px">{{ title }}</div>
+        <table class="matrix">
+          <tr><th>发端 \ 收端</th>{% for d in result.pod_names %}<th>{{ d }}</th>{% endfor %}</tr>
+          {% for s in result.pod_names %}
+          <tr>
+            <th>{{ s }}</th>
+            {% for d in result.pod_names %}
+            {% set v = matrix[(s, d)] %}
+            {% set changed = result.before[(s, d)] != result.after[(s, d)] %}
+            <td class="{{ 'yes' if v else 'no' }}{{ ' diff' if changed else '' }}">{{ '✓' if v else '✗' }}</td>
+            {% endfor %}
+          </tr>
+          {% endfor %}
+        </table>
+      </div>
+      {% endfor %}
+    </div>
+  </div>
+  {% endif %}
+
+  <template id="pod-template">
+    <div class="row pod-row">
+      <label class="field">名称<input type="text" data-field="pod_name_{i}"></label>
+      <label class="field">标签<input type="text" data-field="pod_labels_{i}"></label>
+      <button type="button" class="btn-remove" onclick="removeRow(this)">删除 Pod</button>
+    </div>
+  </template>
+
+  <template id="policy-template">
+    <div class="row policy-row">
+      <label class="field">策略名<input type="text" data-field="policy_name_{i}"></label>
+      <label class="field">Pod 选择器<input type="text" data-field="policy_selector_{i}"></label>
+      <div class="checks">
+        <label><input type="checkbox" data-field="policy_ingress_{i}"> 入站</label>
+        <label><input type="checkbox" data-field="policy_egress_{i}"> 出站</label>
+      </div>
+      <label class="field">入站对端（每行一个）<textarea data-field="policy_ingress_peers_{i}"></textarea></label>
+      <label class="field">出站对端（每行一个）<textarea data-field="policy_egress_peers_{i}"></textarea></label>
+      <div class="checks">
+        <label><input type="checkbox" data-field="policy_deletable_{i}"> 可删</label>
+      </div>
+      <button type="button" class="btn-remove" onclick="removeRow(this)">删除行</button>
+    </div>
+  </template>
+
+  <script>
+    const MAX_POLICIES = {{ max_policies }};
+
+    function reindex(container) {
+      container.querySelectorAll(':scope > .row').forEach((row, i) => {
+        row.querySelectorAll('[data-field]').forEach(el => {
+          el.name = el.dataset.field.replace('{i}', i);
+          el.id = el.name;
+        });
+      });
+    }
+
+    function updatePolicyCount() {
+      const count = document.querySelectorAll('#policy-container > .row').length;
+      document.getElementById('policy-count').textContent = count;
+      document.getElementById('add-policy-btn').disabled = count >= MAX_POLICIES;
+    }
+
+    function addPod() {
+      const node = document.getElementById('pod-template').content.cloneNode(true);
+      document.getElementById('pod-container').appendChild(node);
+      reindex(document.getElementById('pod-container'));
+    }
+
+    function addPolicy() {
+      const container = document.getElementById('policy-container');
+      if (container.querySelectorAll(':scope > .row').length >= MAX_POLICIES) return;
+      const node = document.getElementById('policy-template').content.cloneNode(true);
+      container.appendChild(node);
+      reindex(container);
+      updatePolicyCount();
+    }
+
+    function removeRow(btn) {
+      btn.closest('.row').remove();
+      reindex(document.getElementById('pod-container'));
+      reindex(document.getElementById('policy-container'));
+      updatePolicyCount();
+    }
+
+    document.getElementById('main-form').addEventListener('submit', () => {
+      reindex(document.getElementById('pod-container'));
+      reindex(document.getElementById('policy-container'));
+    });
+
+    reindex(document.getElementById('pod-container'));
+    reindex(document.getElementById('policy-container'));
+    updatePolicyCount();
+  </script>
+</body>
+</html>
